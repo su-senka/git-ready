@@ -1,0 +1,224 @@
+#!/usr/bin/env pwsh
+
+$USAGE = @'
+git ready – rebase current branch onto an integration branch (default: dev) then optionally push with --force-with-lease.
+Usage:
+  git ready [options]
+  git ready continue
+  git ready abort
+Options:
+  --branch|--onto <name>   Integration branch (default: dev)
+  --remote <name>          Remote (default: origin)
+  --no-fetch               Skip fetch
+  --no-push                Skip push
+  --yes                    Auto-confirm force push
+  --autosquash             Interactive rebase with --autosquash -i
+  --dry-run                Show actions only
+  --allow-dirty            Allow dirty working tree
+  --stash                  Auto-stash & pop around rebase
+  -h, --help               Show this summary
+'@
+
+$ErrorActionPreference = 'Stop'
+
+function die($msg, $code=1) {
+  Write-Host "ERROR: $msg" -ForegroundColor Red
+  exit $code
+}
+
+function Show-Usage { $USAGE | Write-Output }
+
+$mode = "prep"    # prep | continue | abort
+$branch = "dev"
+$remote = "origin"
+$doFetch = $true
+$doPush = $true
+$forceYes = $false
+$autoSquash = $false
+$dryRun = $false
+$allowDirty = $false
+$stashChanges = $false
+ $help = $false
+
+for ($i = 0; $i -lt $args.Length; $i++) {
+  $a = $args[$i]
+  switch ($a) {
+    { $_ -in @('continue','abort') } { $mode = $a; continue }
+    { $_ -in @('-h','--help') } { $help = $true; continue }
+    '--no-fetch' { $doFetch = $false; continue }
+    '--no-push'  { $doPush = $false; continue }
+    '--yes'      { $forceYes = $true; continue }
+    '--autosquash' { $autoSquash = $true; continue }
+    '--dry-run'  { $dryRun = $true; continue }
+    '--allow-dirty' { $allowDirty = $true; continue }
+    '--stash'    { $stashChanges = $true; continue }
+    { $_ -in @('--branch','--onto') } { $i++; if ($i -ge $args.Length) { die "--branch requires a value" }; $branch = $args[$i]; continue }
+    '--remote' { $i++; if ($i -ge $args.Length) { die "--remote requires a value" }; $remote = $args[$i]; continue }
+    default { if ($a.StartsWith('-')) { die "Unknown option: $a" } else { die "Unknown arg: $a" } }
+  }
+}
+
+if ($help) { Show-Usage; exit 0 }
+
+function Invoke-GitSwitch($target) {
+  $switched = $false
+  if ($dryRun) { Write-Host "(dry-run) git switch/checkout $target" -ForegroundColor DarkGray; return }
+  try { & git switch $target *> $null; $switched = $true } catch {}
+  if (-not $switched) { & git checkout $target }
+}
+
+function run-git([string[]]$cmd) {
+  $display = 'git ' + ($cmd -join ' ')
+  if ($dryRun) { Write-Host "(dry-run) $display" -ForegroundColor DarkGray; return 0 }
+  & git @cmd
+  return $LASTEXITCODE
+}
+
+function Test-WorkingTreeDirty() {
+  & git diff --quiet; $w1 = $LASTEXITCODE
+  & git diff --cached --quiet; $w2 = $LASTEXITCODE
+  return ($w1 -ne 0 -or $w2 -ne 0)
+}
+
+function Test-RebaseInProgress() {
+  $gitDir = (& git rev-parse --git-dir).Trim()
+  return (Test-Path (Join-Path $gitDir 'rebase-merge')) -or (Test-Path (Join-Path $gitDir 'rebase-apply'))
+}
+
+function confirm($msg) {
+  if ($forceYes -or $env:GIT_READY_ASSUME_YES -eq '1') { return $true }
+  if ($dryRun) { Write-Host "(dry-run) would confirm: $msg" -ForegroundColor DarkGray; return $true }
+  $resp = Read-Host "$msg (y/N)"
+  return ($resp -match '^[yY]$')
+}
+
+if ($mode -eq "continue") {
+  if ($dryRun) { Write-Host "(dry-run) git rebase --continue"; exit 0 }
+  & git rebase --continue
+  $rebCode = $LASTEXITCODE
+  if ($rebCode -ne 0) { exit $rebCode }
+  # Rebase step succeeded (may or may not mean sequence is fully done, but git exits 0 only when finished)
+  # Perform push unless disabled
+  if (-not $doPush) {
+    Write-Host "Rebase step complete; skipping push (--no-push)." -ForegroundColor Yellow
+    exit 0
+  }
+  $hasUpstream = $true
+  & git rev-parse --symbolic-full-name '@{u}' *> $null
+  if ($LASTEXITCODE -ne 0) { $hasUpstream = $false }
+  if (-not $hasUpstream) { Write-Host "No upstream for '$((git rev-parse --abbrev-ref HEAD).Trim())'. Will set upstream on push." -ForegroundColor Yellow }
+  if (-not (confirm "Force push (with lease) '$((git rev-parse --abbrev-ref HEAD).Trim())' to $remote?")) { Write-Host "User declined push." -ForegroundColor Yellow; exit 0 }
+  $CURR = (& git rev-parse --abbrev-ref HEAD).Trim()
+  $pushArgs = @('push','--force-with-lease',$remote,$CURR)
+  if (-not $hasUpstream) { $pushArgs = @('push','--set-upstream','--force-with-lease',$remote,$CURR) }
+  & git @pushArgs
+  if ($LASTEXITCODE -ne 0) { Write-Host "Push failed after rebase continue." -ForegroundColor Red; exit $LASTEXITCODE }
+  Write-Host "Branch '$CURR' pushed (after rebase continue)." -ForegroundColor Green
+  exit 0
+}
+if ($mode -eq "abort") {
+  if ($dryRun) { Write-Host "(dry-run) git rebase --abort"; exit 0 }
+  & git rebase --abort; exit $LASTEXITCODE
+}
+
+& git rev-parse --is-inside-work-tree *> $null
+if ($LASTEXITCODE -ne 0) { die "Not a git repository." }
+
+$CURRENT = (& git rev-parse --abbrev-ref HEAD).Trim()
+if ($CURRENT -eq 'HEAD') { die "Detached HEAD; checkout a branch first." }
+
+if (Test-RebaseInProgress) {
+  Write-Host "A rebase appears to be in progress. Use 'git ready continue' or 'git ready abort'." -ForegroundColor Yellow
+  exit 1
+}
+
+if ($CURRENT -eq $branch -or $CURRENT -eq 'main') {
+  Write-Host "You’re on '$CURRENT'. Run this from a feature branch." -ForegroundColor Yellow
+  exit 1
+}
+
+if (Test-WorkingTreeDirty) {
+  if ($stashChanges) {
+    if ($dryRun) { Write-Host "(dry-run) git stash push -u --keep-index" -ForegroundColor DarkGray }
+    else { & git stash push -u --keep-index | Out-Null; $STASHED = $true }
+  } elseif (-not $allowDirty) {
+    die "Working tree or index dirty. Commit, stash, or use --allow-dirty / --stash."
+  }
+}
+
+& git remote get-url $remote *> $null
+if ($LASTEXITCODE -ne 0) { die "Remote '$remote' not configured." }
+if ($doFetch) {
+  Write-Host "Fetching from $remote..." -ForegroundColor Cyan
+  run-git @('fetch', $remote) | Out-Null
+}
+
+$remoteHasBranch = (& git ls-remote --heads $remote $branch) -ne ''
+if (-not $remoteHasBranch) { die "Remote '$remote' has no branch '$branch'" }
+
+$localHasBranch = (& git show-ref --verify --quiet "refs/heads/$branch" $?)
+if (-not $localHasBranch) {
+  Write-Host "Creating local branch '$branch' tracking $remote/$branch" -ForegroundColor Cyan
+  if (-not $dryRun) { & git branch $branch "$remote/$branch" | Out-Null }
+  else { Write-Host "(dry-run) git branch $branch $remote/$branch" -ForegroundColor DarkGray }
+}
+
+Write-Host "Updating $branch from $remote/$branch..." -ForegroundColor Cyan
+Invoke-GitSwitch $branch
+if ($dryRun) { Write-Host "(dry-run) git pull --ff-only $remote $branch" -ForegroundColor DarkGray }
+else { & git pull --ff-only $remote $branch }
+
+Write-Host "↩Switching back to $CURRENT..." -ForegroundColor Cyan
+Invoke-GitSwitch $CURRENT
+
+Write-Host "Rebasing '$CURRENT' onto '$branch'..." -ForegroundColor Cyan
+$rebaseArgs = @('rebase')
+if ($autoSquash) { $rebaseArgs += @('--autosquash','-i') }
+$rebaseArgs += $branch
+if ($dryRun) { Write-Host "(dry-run) git $($rebaseArgs -join ' ')" -ForegroundColor DarkGray; $code = 0 }
+else { & git @rebaseArgs; $code = $LASTEXITCODE }
+
+if ($code -ne 0) {
+  Write-Host ""; Write-Host "Rebase hit conflicts." -ForegroundColor Yellow
+  Write-Host "Resolve conflicts, stage changes, then: git ready continue" -ForegroundColor Yellow
+  Write-Host "Or abort: git ready abort" -ForegroundColor Yellow
+  if ($stashChanges -and $STASHED) {
+    Write-Host "Note: you used --stash; your extra changes are still stashed." -ForegroundColor Yellow
+  }
+  exit $code
+}
+
+Write-Host "Rebase complete. '$CURRENT' now based on '$branch'." -ForegroundColor Green
+
+if ($stashChanges -and $STASHED) {
+  Write-Host "Restoring stashed changes..." -ForegroundColor Cyan
+  if ($dryRun) { Write-Host "(dry-run) git stash pop" -ForegroundColor DarkGray }
+  else { & git stash pop | Out-Null }
+}
+
+if (-not $doPush) {
+  Write-Host "Skipping push (--no-push)." -ForegroundColor Yellow
+  exit 0
+}
+
+# Determine if upstream exists
+$hasUpstream = $true
+& git rev-parse --symbolic-full-name '@{u}' *> $null
+if ($LASTEXITCODE -ne 0) { $hasUpstream = $false }
+
+if (-not $hasUpstream) {
+  Write-Host "No upstream for '$CURRENT'. Will set upstream on push." -ForegroundColor Yellow
+}
+
+if (-not $dryRun) {
+  if (-not (confirm "Force push (with lease) '$CURRENT' to $remote?")) { Write-Host "User declined push." -ForegroundColor Yellow; exit 0 }
+}
+
+$pushArgs = @('push','--force-with-lease',$remote,$CURRENT)
+if (-not $hasUpstream) { $pushArgs = @('push','--set-upstream','--force-with-lease',$remote,$CURRENT) }
+
+if ($dryRun) { Write-Host "(dry-run) git $($pushArgs -join ' ')" -ForegroundColor DarkGray; exit 0 }
+& git @pushArgs
+if ($LASTEXITCODE -ne 0) { Write-Host "Push failed." -ForegroundColor Red; exit $LASTEXITCODE }
+
+Write-Host "Branch '$CURRENT' rebased and pushed to $remote ($branch base)." -ForegroundColor Green
