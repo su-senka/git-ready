@@ -67,7 +67,7 @@ function Invoke-GitSwitch($target) {
   if (-not $switched) { & git checkout $target }
 }
 
-function run-git([string[]]$cmd) {
+function Invoke-Git([string[]]$cmd) {
   $display = 'git ' + ($cmd -join ' ')
   if ($dryRun) { Write-Host "(dry-run) $display" -ForegroundColor DarkGray; return 0 }
   & git @cmd
@@ -150,7 +150,7 @@ if (Test-WorkingTreeDirty) {
 if ($LASTEXITCODE -ne 0) { die "Remote '$remote' not configured." }
 if ($doFetch) {
   Write-Host "Fetching from $remote..." -ForegroundColor Cyan
-  run-git @('fetch', $remote) | Out-Null
+  Invoke-Git @('fetch', $remote) | Out-Null
 }
 
 $remoteHasBranch = (& git ls-remote --heads $remote $branch) -ne ''
